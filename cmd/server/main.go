@@ -27,16 +27,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.NewShopStore(cfg.Store.BaseURL, cfg.Store.BearerToken)
+	st, err := store.NewShopStore(cfg.Store.BaseURL, cfg.Store.BearerToken, logger)
 	if err != nil {
 		logger.Error("failed to init shop store", "error", err)
 		os.Exit(1)
 	}
 
-	steamClient := steam.NewClient(cfg.Steam.UserAgent)
+	steamClient := steam.NewClient(cfg.Steam.UserAgent, logger)
 	otpClient := otp.NewClient(cfg.OTP)
 	tokenService := tokensvc.New(st, steamClient, otpClient, logger)
-	server := api.New(st, tokenService, cfg.AdminToken, cfg.LauncherToken)
+	server := api.New(st, tokenService, cfg.AdminToken, cfg.LauncherToken, logger)
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,

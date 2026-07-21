@@ -3,11 +3,13 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"playgate/steam-token-server/internal/store"
+	"playgate/steam-token-server/internal/tokendiag"
 	"playgate/steam-token-server/internal/tokensvc"
 )
 
@@ -16,14 +18,24 @@ type Server struct {
 	tokens        *tokensvc.Service
 	adminToken    string
 	launcherToken string
+	logger        *slog.Logger
 }
 
-func New(st store.AccountStore, tokens *tokensvc.Service, adminToken, launcherToken string) *Server {
+func New(
+	st store.AccountStore,
+	tokens *tokensvc.Service,
+	adminToken, launcherToken string,
+	logger *slog.Logger,
+) *Server {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Server{
 		store:         st,
 		tokens:        tokens,
 		adminToken:    adminToken,
 		launcherToken: launcherToken,
+		logger:        logger,
 	}
 }
 
@@ -112,15 +124,25 @@ type issueTokenRequest struct {
 }
 
 func (s *Server) handleIssueToken(w http.ResponseWriter, r *http.Request) {
+	startedAt := time.Now()
 	var req issueTokenRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.logger.Warn("launcher token request rejected: invalid JSON", "remote_addr", r.RemoteAddr, "error", err)
 		writeError(w, http.StatusBadRequest, "invalid json")
 		return
 	}
 	if strings.TrimSpace(req.Login) == "" {
+		s.logger.Warn("launcher token request rejected: empty login", "remote_addr", r.RemoteAddr)
 		writeError(w, http.StatusBadRequest, "login is required")
 		return
 	}
+	s.logger.Info(
+		"launcher token request received",
+		"login", strings.TrimSpace(req.Login),
+		"force_refresh", req.ForceRefresh,
+		"remote_addr", r.RemoteAddr,
+		"user_agent", r.UserAgent(),
+	)
 
 	issued, err := s.tokens.Issue(r.Context(), req.Login, req.ForceRefresh)
 	if err != nil {
@@ -134,10 +156,28 @@ func (s *Server) handleIssueToken(w http.ResponseWriter, r *http.Request) {
 		case strings.Contains(msg, "otp bearerToken"):
 			status = http.StatusServiceUnavailable
 		}
+		s.logger.Error(
+			"launcher token request failed",
+			"login", strings.TrimSpace(req.Login),
+			"force_refresh", req.ForceRefresh,
+			"status", status,
+			"duration", time.Since(startedAt),
+			"error", err,
+		)
 		writeError(w, status, msg)
 		return
 	}
 
+	s.logger.Info(
+		"sending token response to launcher",
+		"login", issued.Login,
+		"steam_id", issued.SteamID,
+		"from_cache", issued.FromCache,
+		"expires_at", issued.ExpiresAt,
+		"duration", time.Since(startedAt),
+		tokendiag.Attr("refresh_token", issued.RefreshToken),
+		tokendiag.Attr("access_token", issued.AccessToken),
+	)
 	writeJSON(w, http.StatusOK, issued)
 }
 

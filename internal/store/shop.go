@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"playgate/steam-token-server/internal/tokendiag"
 )
 
 // ShopStore persists accounts and Steam JWT sessions via playgate shop internal API.
@@ -18,9 +21,10 @@ type ShopStore struct {
 	httpClient  *http.Client
 	baseURL     string
 	bearerToken string
+	logger      *slog.Logger
 }
 
-func NewShopStore(baseURL, bearerToken string) (*ShopStore, error) {
+func NewShopStore(baseURL, bearerToken string, logger *slog.Logger) (*ShopStore, error) {
 	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	bearerToken = strings.TrimSpace(bearerToken)
 	if baseURL == "" {
@@ -29,10 +33,14 @@ func NewShopStore(baseURL, bearerToken string) (*ShopStore, error) {
 	if bearerToken == "" {
 		return nil, fmt.Errorf("shop store bearerToken is required")
 	}
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &ShopStore{
 		httpClient:  &http.Client{Timeout: 30 * time.Second},
 		baseURL:     baseURL,
 		bearerToken: bearerToken,
+		logger:      logger,
 	}, nil
 }
 
@@ -125,6 +133,17 @@ func (s *ShopStore) GetToken(login string) (*CachedToken, error) {
 		return nil, err
 	}
 	tok := out.toCachedToken()
+	s.logger.Info(
+		"shop token session decoded",
+		"login", tok.Login,
+		"steam_id", tok.SteamID,
+		"expires_at", tok.ExpiresAt,
+		"updated_at", tok.UpdatedAt,
+		"guard_data_present", tok.GuardData != "",
+		"guard_data_length", len(tok.GuardData),
+		tokendiag.Attr("refresh_token", tok.RefreshToken),
+		tokendiag.Attr("access_token", tok.AccessToken),
+	)
 	return &tok, nil
 }
 
@@ -145,7 +164,28 @@ func (s *ShopStore) SaveToken(tok CachedToken) error {
 		"guardData":    tok.GuardData,
 		"expiresAt":    expiresAt.UTC().Format(time.RFC3339),
 	}
-	return s.do(context.Background(), http.MethodPut, "/api/internal/steam-auth/session", body, nil)
+	s.logger.Info(
+		"sending token session to shop",
+		"login", login,
+		"steam_id", tok.SteamID,
+		"expires_at", expiresAt,
+		"guard_data_present", tok.GuardData != "",
+		"guard_data_length", len(tok.GuardData),
+		tokendiag.Attr("refresh_token", tok.RefreshToken),
+		tokendiag.Attr("access_token", tok.AccessToken),
+	)
+	err := s.do(context.Background(), http.MethodPut, "/api/internal/steam-auth/session", body, nil)
+	if err != nil {
+		s.logger.Error("shop token session save failed", "login", login, "error", err)
+		return err
+	}
+	s.logger.Info(
+		"shop token session save succeeded",
+		"login", login,
+		tokendiag.Attr("refresh_token", tok.RefreshToken),
+		tokendiag.Attr("access_token", tok.AccessToken),
+	)
+	return nil
 }
 
 func (s *ShopStore) InvalidateToken(login string) error {
@@ -219,6 +259,7 @@ func (d shopSessionDTO) toCachedToken() CachedToken {
 }
 
 func (s *ShopStore) do(ctx context.Context, method, path string, body any, out any) error {
+	startedAt := time.Now()
 	var reader io.Reader
 	if body != nil {
 		raw, err := json.Marshal(body)
@@ -240,11 +281,26 @@ func (s *ShopStore) do(ctx context.Context, method, path string, body any, out a
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
+		s.logger.Error(
+			"shop request failed",
+			"method", method,
+			"path", path,
+			"duration", time.Since(startedAt),
+			"error", err,
+		)
 		return fmt.Errorf("shop store request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	s.logger.Info(
+		"shop response received",
+		"method", method,
+		"path", path,
+		"status", resp.StatusCode,
+		"duration", time.Since(startedAt),
+		"response_bytes", len(raw),
+	)
 	switch resp.StatusCode {
 	case http.StatusOK, http.StatusNoContent:
 		if out != nil && len(raw) > 0 {
