@@ -10,15 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"math/big"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"time"
-
-	"playgate/steam-token-server/internal/tokendiag"
 )
 
 const apiBase = "https://api.steampowered.com"
@@ -39,7 +36,6 @@ const platformSteamClient = 1
 type Client struct {
 	http      *http.Client
 	userAgent string
-	logger    *slog.Logger
 }
 
 type AuthResult struct {
@@ -52,19 +48,15 @@ type AuthResult struct {
 
 type GuardCodeFunc func(ctx context.Context) (string, error)
 
-func NewClient(userAgent string, logger *slog.Logger) *Client {
+func NewClient(userAgent string) *Client {
 	if userAgent == "" {
 		userAgent = "PlayGateSteamTokenServer/0.1"
-	}
-	if logger == nil {
-		logger = slog.Default()
 	}
 	return &Client{
 		http: &http.Client{
 			Timeout: 45 * time.Second,
 		},
 		userAgent: userAgent,
-		logger:    logger,
 	}
 }
 
@@ -80,48 +72,20 @@ func (c *Client) LoginWithCredentials(
 		return nil, fmt.Errorf("username and password are required")
 	}
 
-	loginStartedAt := time.Now()
-	c.logger.Info("Steam credential login started", "login", username)
-
-	rsaStartedAt := time.Now()
 	rsaKey, err := c.getPasswordRSAPublicKey(ctx, username)
 	if err != nil {
-		c.logger.Error("Steam RSA key request failed", "login", username, "duration", time.Since(rsaStartedAt), "error", err)
 		return nil, err
 	}
-	c.logger.Info(
-		"Steam RSA key received",
-		"login", username,
-		"duration", time.Since(rsaStartedAt),
-		"modulus_bits", rsaKey.PublicKey.BitLen(),
-		"exponent", rsaKey.Exponent,
-		"timestamp", rsaKey.Timestamp,
-	)
 
 	encryptedPassword, err := encryptPassword(password, rsaKey.PublicKey, rsaKey.Exponent)
 	if err != nil {
 		return nil, err
 	}
 
-	beginStartedAt := time.Now()
 	begin, err := c.beginAuthSession(ctx, username, encryptedPassword, rsaKey.Timestamp)
 	if err != nil {
-		c.logger.Error("Steam begin auth failed", "login", username, "duration", time.Since(beginStartedAt), "error", err)
 		return nil, err
 	}
-	confirmationTypes := make([]int, 0, len(begin.AllowedConfirmations))
-	for _, confirmation := range begin.AllowedConfirmations {
-		confirmationTypes = append(confirmationTypes, confirmation.ConfirmationType)
-	}
-	c.logger.Info(
-		"Steam auth session started",
-		"login", username,
-		"duration", time.Since(beginStartedAt),
-		"steam_id", begin.SteamID,
-		"allowed_confirmation_types", confirmationTypes,
-		tokendiag.Attr("client_id", begin.ClientID),
-		tokendiag.Attr("request_id", begin.RequestID),
-	)
 
 	// If email/device code is already confirmed in allowed confirmations, submit after OTP arrives.
 	needsCode := false
@@ -133,15 +97,9 @@ func (c *Client) LoginWithCredentials(
 	}
 
 	if needsCode {
-		c.logger.Info(
-			"Steam Guard confirmation required",
-			"login", username,
-			"allowed_confirmation_types", confirmationTypes,
-		)
 		if guardCodeFn == nil {
 			return nil, fmt.Errorf("steam guard code required but no OTP provider configured")
 		}
-		guardStartedAt := time.Now()
 		code, err := guardCodeFn(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("steam guard otp: %w", err)
@@ -159,39 +117,12 @@ func (c *Client) LoginWithCredentials(
 			}
 		}
 
-		c.logger.Info(
-			"submitting Steam Guard code",
-			"login", username,
-			"code_type", codeType,
-			"code_length", len(code),
-			"wait_duration", time.Since(guardStartedAt),
-		)
 		if err := c.submitGuardCode(ctx, begin.ClientID, begin.SteamID, code, codeType); err != nil {
-			c.logger.Error("Steam Guard code submission failed", "login", username, "code_type", codeType, "error", err)
 			return nil, err
 		}
-		c.logger.Info("Steam Guard code accepted for auth session", "login", username, "code_type", codeType)
-	} else {
-		c.logger.Info("Steam Guard confirmation not required", "login", username)
 	}
 
-	result, err := c.pollAuthSession(ctx, begin.ClientID, begin.RequestID)
-	if err != nil {
-		c.logger.Error("Steam credential login failed while polling", "login", username, "duration", time.Since(loginStartedAt), "error", err)
-		return nil, err
-	}
-	c.logger.Info(
-		"Steam credential login completed",
-		"login", username,
-		"duration", time.Since(loginStartedAt),
-		"response_account_name", result.AccountName,
-		"steam_id", result.SteamID,
-		"guard_data_present", result.NewGuardData != "",
-		"guard_data_length", len(result.NewGuardData),
-		tokendiag.Attr("refresh_token", result.RefreshToken),
-		tokendiag.Attr("access_token", result.AccessToken),
-	)
-	return result, nil
+	return c.pollAuthSession(ctx, begin.ClientID, begin.RequestID)
 }
 
 type rsaPublicKeyResponse struct {
@@ -310,21 +241,19 @@ func (c *Client) submitGuardCode(ctx context.Context, clientID, steamID, code st
 
 type pollAuthResponse struct {
 	Response struct {
-		NewGuardData         string `json:"new_guard_data"`
-		RefreshToken         string `json:"refresh_token"`
-		AccessToken          string `json:"access_token"`
-		AccountName          string `json:"account_name"`
-		HadRemoteInteraction bool   `json:"had_remote_interaction"`
+		NewGuardData     string `json:"new_guard_data"`
+		RefreshToken     string `json:"refresh_token"`
+		AccessToken      string `json:"access_token"`
+		AccountName      string `json:"account_name"`
+		HadRemoteInteraction bool `json:"had_remote_interaction"`
 	} `json:"response"`
 }
 
 func (c *Client) pollAuthSession(ctx context.Context, clientID, requestID string) (*AuthResult, error) {
 	deadline := time.Now().Add(2 * time.Minute)
 	interval := 2 * time.Second
-	attempt := 0
 
 	for {
-		attempt++
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf("auth poll timeout")
 		}
@@ -340,17 +269,6 @@ func (c *Client) pollAuthSession(ctx context.Context, clientID, requestID string
 
 		if out.Response.RefreshToken != "" {
 			steamID := steamIDFromJWT(out.Response.RefreshToken)
-			c.logger.Info(
-				"Steam auth poll returned tokens",
-				"attempt", attempt,
-				"account_name", out.Response.AccountName,
-				"steam_id", steamID,
-				"had_remote_interaction", out.Response.HadRemoteInteraction,
-				"guard_data_present", out.Response.NewGuardData != "",
-				"guard_data_length", len(out.Response.NewGuardData),
-				tokendiag.Attr("refresh_token", out.Response.RefreshToken),
-				tokendiag.Attr("access_token", out.Response.AccessToken),
-			)
 			return &AuthResult{
 				AccountName:  out.Response.AccountName,
 				RefreshToken: out.Response.RefreshToken,
@@ -359,7 +277,6 @@ func (c *Client) pollAuthSession(ctx context.Context, clientID, requestID string
 				NewGuardData: out.Response.NewGuardData,
 			}, nil
 		}
-		c.logger.Info("Steam auth poll pending", "attempt", attempt, "next_poll_in", interval)
 
 		timer := time.NewTimer(interval)
 		select {
@@ -394,12 +311,6 @@ func (c *Client) ValidateRefreshToken(ctx context.Context, refreshToken, steamID
 	if steamID == "" {
 		steamID = steamIDFromJWT(refreshToken)
 	}
-	startedAt := time.Now()
-	c.logger.Info(
-		"Steam refresh-token validation started",
-		"steam_id", steamID,
-		tokendiag.Attr("refresh_token", refreshToken),
-	)
 
 	form := url.Values{}
 	form.Set("refresh_token", refreshToken)
@@ -421,30 +332,15 @@ func (c *Client) ValidateRefreshToken(ctx context.Context, refreshToken, steamID
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.logger.Error("Steam refresh-token validation request failed", "steam_id", steamID, "duration", time.Since(startedAt), "error", err)
 		return "", fmt.Errorf("validate refresh token: %w", err)
 	}
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		c.logger.Warn(
-			"Steam rejected refresh token",
-			"steam_id", steamID,
-			"status", resp.StatusCode,
-			"duration", time.Since(startedAt),
-			tokendiag.Attr("refresh_token", refreshToken),
-		)
 		return "", ErrTokenRejected
 	}
 	if resp.StatusCode >= 400 {
-		c.logger.Warn(
-			"Steam refresh-token validation returned error",
-			"steam_id", steamID,
-			"status", resp.StatusCode,
-			"duration", time.Since(startedAt),
-			"response_bytes", len(raw),
-		)
 		return "", fmt.Errorf("validate refresh token: steam http %d: %s", resp.StatusCode, truncate(strings.TrimSpace(string(raw)), 200))
 	}
 
@@ -456,23 +352,8 @@ func (c *Client) ValidateRefreshToken(ctx context.Context, refreshToken, steamID
 	}
 	// 200 but no access token back ⇒ Steam did not honour the token.
 	if out.Response.AccessToken == "" {
-		c.logger.Warn(
-			"Steam refresh-token validation returned no access token",
-			"steam_id", steamID,
-			"status", resp.StatusCode,
-			"duration", time.Since(startedAt),
-			tokendiag.Attr("refresh_token", refreshToken),
-		)
 		return "", ErrTokenRejected
 	}
-	c.logger.Info(
-		"Steam refresh-token validation succeeded",
-		"steam_id", steamID,
-		"status", resp.StatusCode,
-		"duration", time.Since(startedAt),
-		tokendiag.Attr("refresh_token", refreshToken),
-		tokendiag.Attr("access_token", out.Response.AccessToken),
-	)
 	return out.Response.AccessToken, nil
 }
 
@@ -511,16 +392,8 @@ func (c *Client) postFormJSON(ctx context.Context, path string, form url.Values,
 }
 
 func (c *Client) doJSON(req *http.Request, dst any) error {
-	startedAt := time.Now()
 	resp, err := c.http.Do(req)
 	if err != nil {
-		c.logger.Error(
-			"Steam API request failed",
-			"method", req.Method,
-			"path", req.URL.Path,
-			"duration", time.Since(startedAt),
-			"error", err,
-		)
 		return err
 	}
 	defer resp.Body.Close()
@@ -528,14 +401,6 @@ func (c *Client) doJSON(req *http.Request, dst any) error {
 	if err != nil {
 		return err
 	}
-	c.logger.Info(
-		"Steam API response received",
-		"method", req.Method,
-		"path", req.URL.Path,
-		"status", resp.StatusCode,
-		"duration", time.Since(startedAt),
-		"response_bytes", len(raw),
-	)
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("steam http %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
