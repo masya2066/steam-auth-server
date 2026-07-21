@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"playgate/steam-token-server/internal/otp"
@@ -24,8 +25,11 @@ type IssuedToken struct {
 	SteamID      string    `json:"steamId,omitempty"`
 	RefreshToken string    `json:"refreshToken"`
 	AccessToken  string    `json:"accessToken,omitempty"`
-	ExpiresAt    time.Time `json:"expiresAt"`
-	FromCache    bool      `json:"fromCache"`
+	// GuardData is Steam new_guard_data (machine JWT). Desktop client needs it in
+	// config.vdf RememberedMachineID or ConnectCache login stays unauthorized.
+	GuardData string    `json:"guardData,omitempty"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	FromCache bool      `json:"fromCache"`
 }
 
 func New(st store.AccountStore, steamClient *steam.Client, otpClient *otp.Client, logger *slog.Logger) *Service {
@@ -63,11 +67,18 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 						cached.AccessToken = access
 						_ = s.store.SaveToken(*cached)
 					}
+					// Desktop Steam needs machine guard data alongside the refresh JWT.
+					// If the shop session was saved without it, force a fresh login.
+					if strings.TrimSpace(cached.GuardData) == "" {
+						s.logger.Warn("cached token has no guardData; performing fresh steam login", "login", acc.Login)
+						break
+					}
 					return &IssuedToken{
 						Login:        cached.Login,
 						SteamID:      cached.SteamID,
 						RefreshToken: cached.RefreshToken,
 						AccessToken:  cached.AccessToken,
+						GuardData:    cached.GuardData,
 						ExpiresAt:    cached.ExpiresAt,
 						FromCache:    true,
 					}, nil
@@ -76,13 +87,18 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 					// fall through to a full login below.
 				default:
 					// Transient validation failure (network / Steam 5xx). Don't burn an OTP —
-					// serve the cached token and let the client try it.
+					// serve the cached token and let the client try it (only if guardData present).
+					if strings.TrimSpace(cached.GuardData) == "" {
+						s.logger.Warn("could not validate cached token and guardData missing; performing fresh steam login", "login", acc.Login, "error", verr)
+						break
+					}
 					s.logger.Warn("could not validate cached token; serving cache", "login", acc.Login, "error", verr)
 					return &IssuedToken{
 						Login:        cached.Login,
 						SteamID:      cached.SteamID,
 						RefreshToken: cached.RefreshToken,
 						AccessToken:  cached.AccessToken,
+						GuardData:    cached.GuardData,
 						ExpiresAt:    cached.ExpiresAt,
 						FromCache:    true,
 					}, nil
@@ -133,6 +149,7 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 		SteamID:      steamID,
 		RefreshToken: auth.RefreshToken,
 		AccessToken:  auth.AccessToken,
+		GuardData:    auth.NewGuardData,
 		ExpiresAt:    expires,
 		FromCache:    false,
 	}, nil
