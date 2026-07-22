@@ -26,3 +26,5 @@ store:
   # Leave empty to reuse otp.baseURL and otp.bearerToken.
   baseURL: ""
   bearerToken: ""
+  # Local JWT/guardData overlay (default: data/token-cache.json).
+  localCachePath: "data/token-cache.json"

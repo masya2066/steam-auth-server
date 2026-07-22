@@ -350,10 +350,8 @@ func (c *Client) ValidateRefreshToken(ctx context.Context, refreshToken, steamID
 			return "", fmt.Errorf("validate refresh token json: %w", err)
 		}
 	}
-	// 200 but no access token back ⇒ Steam did not honour the token.
-	if out.Response.AccessToken == "" {
-		return "", ErrTokenRejected
-	}
+	// 200 but no access token back ⇒ Steam still accepted the refresh (some responses omit it).
+	// Only treat explicit auth failures as rejection.
 	return out.Response.AccessToken, nil
 }
 
@@ -444,6 +442,11 @@ func anyToString(v any) string {
 
 // steamIDFromJWT extracts "sub" from an unverified JWT payload.
 func steamIDFromJWT(token string) string {
+	return SteamIDFromJWT(token)
+}
+
+// SteamIDFromJWT extracts "sub" from an unverified JWT payload.
+func SteamIDFromJWT(token string) string {
 	parts := strings.Split(token, ".")
 	if len(parts) < 2 {
 		return ""
@@ -459,4 +462,23 @@ func steamIDFromJWT(token string) string {
 		return ""
 	}
 	return claims.Sub
+}
+
+// ExpFromJWT extracts "exp" (unix seconds) from an unverified JWT payload.
+func ExpFromJWT(token string) time.Time {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return time.Time{}
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(claims.Exp, 0).UTC()
 }

@@ -33,8 +33,9 @@ type SteamConfig struct {
 // StoreConfig points at the shop internal API used as account/session storage.
 // When baseURL/bearerToken are empty, otp.baseURL / otp.bearerToken are reused.
 type StoreConfig struct {
-	BaseURL     string `yaml:"baseURL"`
-	BearerToken string `yaml:"bearerToken"`
+	BaseURL        string `yaml:"baseURL"`
+	BearerToken    string `yaml:"bearerToken"`
+	LocalCachePath string `yaml:"localCachePath"`
 }
 
 func Load(path string) (*Config, error) {
@@ -99,6 +100,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Store.BearerToken == "" {
 		c.Store.BearerToken = c.OTP.BearerToken
+	}
+	if strings.TrimSpace(c.Store.LocalCachePath) == "" {
+		c.Store.LocalCachePath = "data/token-cache.json"
 	}
 }
 
