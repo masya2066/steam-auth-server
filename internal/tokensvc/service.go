@@ -39,12 +39,8 @@ func New(st store.AccountStore, steamClient *steam.Client, otpClient *otp.Client
 	return &Service{store: st, steam: steamClient, otp: otpClient, logger: logger}
 }
 
-// Issue returns a Steam refresh token for the launcher.
-//
-// Cache-first policy:
-//  1. load cached session
-//  2. if refresh JWT is still in date and Steam accepts it → return cache (fromCache=true)
-//  3. only then perform a full Steam login (password + OTP) and persist
+// Issue looks up the account by Steam login and returns a refresh token.
+// Uses cache when possible; otherwise logs into Steam (OTP via account otpKey if Guard is required).
 func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*IssuedToken, error) {
 	acc, err := s.store.GetAccount(login)
 	if err != nil {
@@ -57,10 +53,58 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 		return nil, fmt.Errorf("account is %s", acc.Status)
 	}
 
-	if forceRefresh {
-		s.logger.Info("forceRefresh requested; skipping cache", "login", acc.Login)
-	} else if issued, ok := s.tryServeCache(ctx, acc.Login); ok {
-		return issued, nil
+	if !forceRefresh {
+		if cached, err := s.store.GetToken(acc.Login); err == nil {
+			if time.Now().Before(cached.ExpiresAt.Add(-24 * time.Hour)) {
+				// A cached token can be invalidated out-of-band: the account owner may log
+				// out of Steam manually or change the password, which revokes the refresh
+				// token even though it has not expired. Verify it against Steam before
+				// serving it; only re-login when Steam actually rejects it.
+				access, verr := s.steam.ValidateRefreshToken(ctx, cached.RefreshToken, cached.SteamID)
+				switch {
+				case verr == nil:
+					if access != "" && access != cached.AccessToken {
+						cached.AccessToken = access
+						_ = s.store.SaveToken(*cached)
+					}
+					// Desktop Steam needs machine guard data alongside the refresh JWT.
+					// If the shop session was saved without it, force a fresh login.
+					if strings.TrimSpace(cached.GuardData) == "" {
+						s.logger.Warn("cached token has no guardData; performing fresh steam login", "login", acc.Login)
+						break
+					}
+					return &IssuedToken{
+						Login:        cached.Login,
+						SteamID:      cached.SteamID,
+						RefreshToken: cached.RefreshToken,
+						AccessToken:  cached.AccessToken,
+						GuardData:    cached.GuardData,
+						ExpiresAt:    cached.ExpiresAt,
+						FromCache:    true,
+					}, nil
+				case errors.Is(verr, steam.ErrTokenRejected):
+					s.logger.Warn("cached refresh token was invalidated; performing fresh steam login", "login", acc.Login)
+					// fall through to a full login below.
+				default:
+					// Transient validation failure (network / Steam 5xx). Don't burn an OTP —
+					// serve the cached token and let the client try it (only if guardData present).
+					if strings.TrimSpace(cached.GuardData) == "" {
+						s.logger.Warn("could not validate cached token and guardData missing; performing fresh steam login", "login", acc.Login, "error", verr)
+						break
+					}
+					s.logger.Warn("could not validate cached token; serving cache", "login", acc.Login, "error", verr)
+					return &IssuedToken{
+						Login:        cached.Login,
+						SteamID:      cached.SteamID,
+						RefreshToken: cached.RefreshToken,
+						AccessToken:  cached.AccessToken,
+						GuardData:    cached.GuardData,
+						ExpiresAt:    cached.ExpiresAt,
+						FromCache:    true,
+					}, nil
+				}
+			}
+		}
 	}
 
 	s.logger.Info("performing steam login", "login", acc.Login)
@@ -81,15 +125,8 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 	if steamID == "" {
 		steamID = acc.SteamID
 	}
-	if steamID == "" {
-		steamID = steam.SteamIDFromJWT(auth.RefreshToken)
-	}
 
-	expires := steam.ExpFromJWT(auth.RefreshToken)
-	if expires.IsZero() {
-		expires = time.Now().UTC().Add(180 * 24 * time.Hour)
-	}
-
+	expires := time.Now().UTC().Add(180 * 24 * time.Hour)
 	cached := store.CachedToken{
 		Login:        acc.Login,
 		RefreshToken: auth.RefreshToken,
@@ -97,21 +134,15 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 		SteamID:      steamID,
 		GuardData:    auth.NewGuardData,
 		ExpiresAt:    expires,
-		UpdatedAt:    time.Now().UTC(),
 	}
 	if err := s.store.SaveToken(cached); err != nil {
 		return nil, fmt.Errorf("save token: %w", err)
-	}
-	if strings.TrimSpace(auth.NewGuardData) == "" {
-		s.logger.Warn("steam login returned empty guardData; desktop auto-login may fail", "login", acc.Login)
 	}
 
 	if steamID != "" && acc.SteamID != steamID {
 		acc.SteamID = steamID
 		_, _ = s.store.UpsertAccount(*acc)
 	}
-
-	s.logger.Info("issued fresh steam token", "login", acc.Login, "expiresAt", expires, "hasGuardData", strings.TrimSpace(auth.NewGuardData) != "")
 
 	return &IssuedToken{
 		Login:        acc.Login,
@@ -122,67 +153,4 @@ func (s *Service) Issue(ctx context.Context, login string, forceRefresh bool) (*
 		ExpiresAt:    expires,
 		FromCache:    false,
 	}, nil
-}
-
-func (s *Service) tryServeCache(ctx context.Context, login string) (*IssuedToken, bool) {
-	cached, err := s.store.GetToken(login)
-	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.logger.Info("cache miss", "login", login, "reason", "no session")
-		} else {
-			s.logger.Warn("cache miss", "login", login, "reason", "store error", "error", err)
-		}
-		return nil, false
-	}
-	if strings.TrimSpace(cached.RefreshToken) == "" {
-		s.logger.Info("cache miss", "login", login, "reason", "empty refreshToken")
-		return nil, false
-	}
-
-	expires := cached.ExpiresAt
-	if expires.IsZero() {
-		expires = steam.ExpFromJWT(cached.RefreshToken)
-	}
-	// Refresh slightly before real expiry so clients never get a near-dead JWT.
-	if !expires.IsZero() && !time.Now().Before(expires.Add(-1*time.Hour)) {
-		s.logger.Info("cache miss", "login", login, "reason", "expired", "expiresAt", expires)
-		return nil, false
-	}
-
-	if strings.TrimSpace(cached.GuardData) == "" {
-		// Desktop ConnectCache path needs machine JWT; without it a cache hit is useless.
-		s.logger.Warn("cache miss", "login", login, "reason", "guardData missing")
-		return nil, false
-	}
-
-	access, verr := s.steam.ValidateRefreshToken(ctx, cached.RefreshToken, cached.SteamID)
-	switch {
-	case verr == nil:
-		if access != "" && access != cached.AccessToken {
-			cached.AccessToken = access
-			_ = s.store.SaveToken(*cached)
-		}
-	case errors.Is(verr, steam.ErrTokenRejected):
-		s.logger.Warn("cache miss", "login", login, "reason", "steam rejected refresh token")
-		_ = s.store.InvalidateToken(login)
-		return nil, false
-	default:
-		// Network / Steam blip — still serve cache; JWT expiry already checked.
-		s.logger.Warn("cache validate transient; serving cache", "login", login, "error", verr)
-	}
-
-	if expires.IsZero() {
-		expires = time.Now().UTC().Add(180 * 24 * time.Hour)
-	}
-
-	s.logger.Info("serving cached steam token", "login", login, "expiresAt", expires)
-	return &IssuedToken{
-		Login:        cached.Login,
-		SteamID:      cached.SteamID,
-		RefreshToken: cached.RefreshToken,
-		AccessToken:  cached.AccessToken,
-		GuardData:    cached.GuardData,
-		ExpiresAt:    expires,
-		FromCache:    true,
-	}, true
 }

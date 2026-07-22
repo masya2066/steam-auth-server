@@ -32,17 +32,11 @@ func main() {
 		logger.Error("failed to init shop store", "error", err)
 		os.Exit(1)
 	}
-	localCache, err := store.NewFileTokenStore(cfg.Store.LocalCachePath)
-	if err != nil {
-		logger.Error("failed to init local token cache", "error", err)
-		os.Exit(1)
-	}
-	accounts := store.NewLayeredStore(st, localCache)
 
 	steamClient := steam.NewClient(cfg.Steam.UserAgent)
 	otpClient := otp.NewClient(cfg.OTP)
-	tokenService := tokensvc.New(accounts, steamClient, otpClient, logger)
-	server := api.New(accounts, tokenService, cfg.AdminToken, cfg.LauncherToken)
+	tokenService := tokensvc.New(st, steamClient, otpClient, logger)
+	server := api.New(st, tokenService, cfg.AdminToken, cfg.LauncherToken)
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -50,12 +44,7 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	logger.Info(
-		"steam token server listening",
-		"addr", cfg.ListenAddr,
-		"store", cfg.Store.BaseURL,
-		"localCache", cfg.Store.LocalCachePath,
-	)
+	logger.Info("steam token server listening", "addr", cfg.ListenAddr, "store", cfg.Store.BaseURL)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
