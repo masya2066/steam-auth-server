@@ -32,9 +32,11 @@ type SteamConfig struct {
 
 // StoreConfig points at the shop internal API used as account/session storage.
 // When baseURL/bearerToken are empty, otp.baseURL / otp.bearerToken are reused.
+// When accountsFile is set, a local JSON account map is used instead (dev/probe).
 type StoreConfig struct {
-	BaseURL     string `yaml:"baseURL"`
-	BearerToken string `yaml:"bearerToken"`
+	BaseURL      string `yaml:"baseURL"`
+	BearerToken  string `yaml:"bearerToken"`
+	AccountsFile string `yaml:"accountsFile"`
 }
 
 func Load(path string) (*Config, error) {
@@ -94,11 +96,13 @@ func (c *Config) applyDefaults() {
 	if c.Steam.UserAgent == "" {
 		c.Steam.UserAgent = "PlayGateSteamTokenServer/0.1"
 	}
-	if c.Store.BaseURL == "" {
-		c.Store.BaseURL = c.OTP.BaseURL
-	}
-	if c.Store.BearerToken == "" {
-		c.Store.BearerToken = c.OTP.BearerToken
+	if strings.TrimSpace(c.Store.AccountsFile) == "" {
+		if c.Store.BaseURL == "" {
+			c.Store.BaseURL = c.OTP.BaseURL
+		}
+		if c.Store.BearerToken == "" {
+			c.Store.BearerToken = c.OTP.BearerToken
+		}
 	}
 }
 
@@ -108,6 +112,9 @@ func (c *Config) validate() error {
 	}
 	if c.LauncherToken == "" || c.LauncherToken == "change-me-launcher" {
 		return fmt.Errorf("launcherToken must be set to a non-default value")
+	}
+	if strings.TrimSpace(c.Store.AccountsFile) != "" {
+		return nil
 	}
 	if c.OTP.BaseURL == "" {
 		return fmt.Errorf("otp.baseURL is required")

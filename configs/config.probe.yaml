@@ -1,0 +1,23 @@
+﻿listenAddr: ":8088"
+
+adminToken: "1234"
+launcherToken: "1234"
+
+otp:
+  baseURL: "https://playgate.store"
+  requestPath: "/api/internal/steam-guard/request-by-login"
+  bearerToken: "nmdeiat8r5bnf2lci4mg1perasjahklsaldkpuk6g2s"
+  initialDelaySec: 5
+  pollIntervalSec: 3
+  pollTimeoutSec: 90
+
+steam:
+  userAgent: "PlayGateSteamTokenServer/0.1"
+
+# Account + JWT session storage via shop internal API.
+# Empty values reuse otp.baseURL / otp.bearerToken.
+store:
+  accountsFile: "data/accounts.json"
+  baseURL: "https://playgate.store"
+  bearerToken: "1234"
+

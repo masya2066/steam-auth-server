@@ -35,7 +35,11 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/admin/steam-accounts", s.withAdmin(s.handleListAccounts))
 	mux.HandleFunc("DELETE /v1/admin/steam-accounts/{login}", s.withAdmin(s.handleDeleteAccount))
 
+	// Deprecated for desktop silent login — VPS-issued GuardData is rejected on client PCs.
 	mux.HandleFunc("POST /v1/steam/tokens", s.withLauncher(s.handleIssueToken))
+	// Preferred: RSA password envelope + OTP; launcher completes Steam auth locally.
+	mux.HandleFunc("POST /v1/steam/auth/envelope", s.withLauncher(s.handleIssueEnvelope))
+	mux.HandleFunc("POST /v1/steam/auth/otp", s.withLauncher(s.handleRequestOtp))
 
 	return mux
 }
@@ -124,21 +128,70 @@ func (s *Server) handleIssueToken(w http.ResponseWriter, r *http.Request) {
 
 	issued, err := s.tokens.Issue(r.Context(), req.Login, req.ForceRefresh)
 	if err != nil {
-		msg := err.Error()
-		status := http.StatusBadGateway
-		switch {
-		case strings.Contains(msg, "account not found"):
-			status = http.StatusNotFound
-		case strings.Contains(msg, "account is"):
-			status = http.StatusConflict
-		case strings.Contains(msg, "otp bearerToken"):
-			status = http.StatusServiceUnavailable
-		}
-		writeError(w, status, msg)
+		writeTokenSvcError(w, err)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, issued)
+}
+
+type loginOnlyRequest struct {
+	Login    string `json:"login"`
+	CodeType int    `json:"codeType,omitempty"` // 2=email, 3=device; optional
+}
+
+func (s *Server) handleIssueEnvelope(w http.ResponseWriter, r *http.Request) {
+	var req loginOnlyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if strings.TrimSpace(req.Login) == "" {
+		writeError(w, http.StatusBadRequest, "login is required")
+		return
+	}
+
+	env, err := s.tokens.IssueEnvelope(r.Context(), req.Login)
+	if err != nil {
+		writeTokenSvcError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, env)
+}
+
+func (s *Server) handleRequestOtp(w http.ResponseWriter, r *http.Request) {
+	var req loginOnlyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid json")
+		return
+	}
+	if strings.TrimSpace(req.Login) == "" {
+		writeError(w, http.StatusBadRequest, "login is required")
+		return
+	}
+
+	otp, err := s.tokens.RequestOtp(r.Context(), req.Login, req.CodeType)
+	if err != nil {
+		writeTokenSvcError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, otp)
+}
+
+func writeTokenSvcError(w http.ResponseWriter, err error) {
+	msg := err.Error()
+	status := http.StatusBadGateway
+	switch {
+	case strings.Contains(msg, "account not found"):
+		status = http.StatusNotFound
+	case strings.Contains(msg, "account is"):
+		status = http.StatusConflict
+	case strings.Contains(msg, "otp bearerToken"):
+		status = http.StatusServiceUnavailable
+	case strings.Contains(msg, "password is empty"):
+		status = http.StatusConflict
+	}
+	writeError(w, status, msg)
 }
 
 func (s *Server) withAdmin(next http.HandlerFunc) http.HandlerFunc {

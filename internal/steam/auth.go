@@ -140,6 +140,43 @@ type rsaKeyMaterial struct {
 	Timestamp string
 }
 
+// PasswordEnvelope is a one-shot RSA-encrypted password for BeginAuthSessionViaCredentials
+// on the end-user PC (launcher never sees plaintext).
+type PasswordEnvelope struct {
+	AccountName         string
+	EncryptedPassword   string
+	EncryptionTimestamp string
+	SteamID             string
+	ExpiresAt           time.Time
+}
+
+// CreatePasswordEnvelope fetches Steam's RSA key and encrypts the account password.
+// Callers must treat the result as short-lived (TTL ~60s).
+func (c *Client) CreatePasswordEnvelope(ctx context.Context, accountName, password, steamID string) (*PasswordEnvelope, error) {
+	accountName = strings.TrimSpace(accountName)
+	if accountName == "" || password == "" {
+		return nil, fmt.Errorf("username and password are required")
+	}
+
+	rsaKey, err := c.getPasswordRSAPublicKey(ctx, accountName)
+	if err != nil {
+		return nil, err
+	}
+
+	encryptedPassword, err := encryptPassword(password, rsaKey.PublicKey, rsaKey.Exponent)
+	if err != nil {
+		return nil, err
+	}
+
+	return &PasswordEnvelope{
+		AccountName:         accountName,
+		EncryptedPassword:   encryptedPassword,
+		EncryptionTimestamp: rsaKey.Timestamp,
+		SteamID:             strings.TrimSpace(steamID),
+		ExpiresAt:           time.Now().UTC().Add(60 * time.Second),
+	}, nil
+}
+
 func (c *Client) getPasswordRSAPublicKey(ctx context.Context, accountName string) (*rsaKeyMaterial, error) {
 	q := url.Values{}
 	q.Set("account_name", accountName)

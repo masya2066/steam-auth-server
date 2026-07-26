@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"playgate/steam-token-server/internal/api"
@@ -27,10 +28,22 @@ func main() {
 		os.Exit(1)
 	}
 
-	st, err := store.NewShopStore(cfg.Store.BaseURL, cfg.Store.BearerToken)
-	if err != nil {
-		logger.Error("failed to init shop store", "error", err)
-		os.Exit(1)
+	var st store.AccountStore
+	if strings.TrimSpace(cfg.Store.AccountsFile) != "" {
+		fileStore, err := store.NewFileAccountStore(cfg.Store.AccountsFile)
+		if err != nil {
+			logger.Error("failed to init file account store", "error", err)
+			os.Exit(1)
+		}
+		st = fileStore
+		logger.Info("using file account store", "path", cfg.Store.AccountsFile)
+	} else {
+		shopStore, err := store.NewShopStore(cfg.Store.BaseURL, cfg.Store.BearerToken)
+		if err != nil {
+			logger.Error("failed to init shop store", "error", err)
+			os.Exit(1)
+		}
+		st = shopStore
 	}
 
 	steamClient := steam.NewClient(cfg.Steam.UserAgent)
@@ -44,7 +57,11 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	logger.Info("steam token server listening", "addr", cfg.ListenAddr, "store", cfg.Store.BaseURL)
+	storeLabel := cfg.Store.BaseURL
+	if strings.TrimSpace(cfg.Store.AccountsFile) != "" {
+		storeLabel = "file:" + cfg.Store.AccountsFile
+	}
+	logger.Info("steam token server listening", "addr", cfg.ListenAddr, "store", storeLabel)
 	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		logger.Error("server stopped", "error", err)
 		os.Exit(1)
