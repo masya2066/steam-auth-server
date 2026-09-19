@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -151,7 +152,7 @@ func (s *Server) handleIssueEnvelope(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	env, err := s.tokens.IssueEnvelope(r.Context(), req.Login)
+	env, err := s.tokens.IssueEnvelope(withOnlineLease(r), req.Login)
 	if err != nil {
 		writeTokenSvcError(w, err)
 		return
@@ -170,12 +171,20 @@ func (s *Server) handleRequestOtp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	otp, err := s.tokens.RequestOtp(r.Context(), req.Login, req.CodeType)
+	otp, err := s.tokens.RequestOtp(withOnlineLease(r), req.Login, req.CodeType)
 	if err != nil {
 		writeTokenSvcError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, otp)
+}
+
+func withOnlineLease(r *http.Request) context.Context {
+	return store.WithOnlineLease(r.Context(), store.OnlineLease{
+		Ticket:    strings.TrimSpace(r.Header.Get("X-PlayGate-Online-Ticket")),
+		SessionID: strings.TrimSpace(r.Header.Get("X-PlayGate-Online-Session")),
+		Epoch:     strings.TrimSpace(r.Header.Get("X-PlayGate-Online-Epoch")),
+	})
 }
 
 func writeTokenSvcError(w http.ResponseWriter, err error) {

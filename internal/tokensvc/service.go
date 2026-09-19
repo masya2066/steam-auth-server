@@ -58,7 +58,7 @@ func New(st store.AccountStore, steamClient *steam.Client, otpClient *otp.Client
 // IssueEnvelope returns a short-lived RSA-encrypted password for the launcher to complete
 // Steam auth on the end-user PC (local machine_id / GuardData). Prefer this over Issue.
 func (s *Service) IssueEnvelope(ctx context.Context, login string) (*PasswordEnvelope, error) {
-	acc, err := s.activeAccount(login)
+	acc, err := s.activeAccount(ctx, login)
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +85,7 @@ func (s *Service) IssueEnvelope(ctx context.Context, login string) (*PasswordEnv
 // codeType: 2 = email (parser), 3 = device/mobile (otpKey TOTP when available).
 // When codeType is 0/unknown, prefer otpKey if present, else email parser.
 func (s *Service) RequestOtp(ctx context.Context, login string, codeType int) (*OtpCode, error) {
-	acc, err := s.activeAccount(login)
+	acc, err := s.activeAccount(ctx, login)
 	if err != nil {
 		return nil, err
 	}
@@ -116,8 +116,11 @@ func (s *Service) RequestOtp(ctx context.Context, login string, codeType int) (*
 	return &OtpCode{Login: acc.Login, Code: code}, nil
 }
 
-func (s *Service) activeAccount(login string) (*store.Account, error) {
-	acc, err := s.store.GetAccount(login)
+func (s *Service) activeAccount(ctx context.Context, login string) (*store.Account, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	acc, err := accountInContext(ctx, s.store, login)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			return nil, fmt.Errorf("account not found")
@@ -128,6 +131,15 @@ func (s *Service) activeAccount(login string) (*store.Account, error) {
 		return nil, fmt.Errorf("account is %s", acc.Status)
 	}
 	return acc, nil
+}
+
+func accountInContext(ctx context.Context, st store.AccountStore, login string) (*store.Account, error) {
+	if aware, ok := st.(interface {
+		GetAccountContext(context.Context, string) (*store.Account, error)
+	}); ok {
+		return aware.GetAccountContext(ctx, login)
+	}
+	return st.GetAccount(login)
 }
 
 // Issue looks up the account by Steam login and returns a refresh token.

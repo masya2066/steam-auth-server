@@ -77,12 +77,21 @@ func (s *ShopStore) UpsertAccount(acc Account) (*Account, error) {
 }
 
 func (s *ShopStore) GetAccount(login string) (*Account, error) {
+	return s.GetAccountContext(context.Background(), login)
+}
+
+// GetAccountContext is GetAccount plus the PlayPass online lease from ctx.
+// Offline calls leave ctx bare; the shop then serves non-pool accounts as before.
+func (s *ShopStore) GetAccountContext(ctx context.Context, login string) (*Account, error) {
 	login = normalizeLogin(login)
 	if login == "" {
 		return nil, fmt.Errorf("login is required")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var out shopAccountDTO
-	err := s.do(context.Background(), http.MethodGet, "/api/internal/steam-auth/account?login="+url.QueryEscape(login), nil, &out)
+	err := s.do(ctx, http.MethodGet, "/api/internal/steam-auth/account?login="+url.QueryEscape(login), nil, &out)
 	if err != nil {
 		return nil, err
 	}
@@ -234,6 +243,15 @@ func (s *ShopStore) do(ctx context.Context, method, path string, body any, out a
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+s.bearerToken)
+	if lease, ok := onlineLeaseFrom(ctx); ok {
+		req.Header.Set("X-PlayGate-Online-Ticket", lease.Ticket)
+		if sessionID := strings.TrimSpace(lease.SessionID); sessionID != "" {
+			req.Header.Set("X-PlayGate-Online-Session", sessionID)
+		}
+		if epoch := strings.TrimSpace(lease.Epoch); epoch != "" {
+			req.Header.Set("X-PlayGate-Online-Epoch", epoch)
+		}
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
